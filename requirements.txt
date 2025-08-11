@@ -1,0 +1,7 @@
+streamlit
+python-dotenv
+pillow
+requests
+PyPDF2
+reportlab
+openai
