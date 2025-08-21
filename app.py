@@ -223,37 +223,263 @@ def extract_damage_parts_from_story(policy_story: str, model_name: str = "gpt-4o
     print(result)
     return result['parts'] if 'parts' in result else []
 
-def extract_parts_from_estimate_copy(estimate_text: str, model_name: str = "gpt-4o") -> list:
-    """Extract car parts names from estimate copy text"""
-    if not estimate_text or estimate_text.strip() == "":
-        return []
-    
+def generate_story_vs_visual_consistency_summary(claim_story: str, story_detected_parts: list, ai_detected_parts: list, model_name: str = "gpt-4o") -> str:
+    """
+    Generate a consistency analysis summary comparing claim story with AI-detected visual damages.
+    Only considers claim story and AI-identified damaged parts from images.
+    """
     prompt = f"""
-    You are an expert automotive parts specialist. Analyze the following estimate copy text and extract ALL vehicle part names mentioned in it.
+    You are an expert vehicle accident analyst. Your task is to compare the `POTENTIAL PARTS FROM STORY` with the `DETECTED PARTS ARRAY` (from images) and generate a 3-4 line consistency analysis. 
     
-    Focus on identifying:
-    - Body parts (bumpers, doors, fenders, hoods, trunks, etc.)
-    - Lights (headlights, tail lights, fog lights, etc.)
-    - Glass components (windshields, windows, mirrors, etc.)
-    - Mechanical parts (engine components, suspension, brakes, etc.)
-    - Interior parts (seats, dashboard, airbags, etc.)
-    - Electrical components (wiring, sensors, etc.)
-    - Structural parts (frame, pillars, panels, etc.)
-    
-    Extract only the actual vehicle part names, not prices, labor, or other non-part items.
-    
-    ESTIMATE COPY TEXT:
-    {estimate_text}
-    
-    Return ONLY a JSON array of part names, e.g. ["front bumper", "headlights", "windshield", "radiator", "door panel"]
-    If no parts are found, return an empty array [].
+    Evaluate if the visually detected damages logically support the accident description. For example, if the story claims impacts to the front, back, and left, but the detected parts only show front damage, your summary must explicitly state that the back and left impacts are not visually substantiated by the provided images. Focus only on the physical consistency between the story and the visual evidence.
+
+    CLAIM STORY: {claim_story}
+
+    POTENTIAL PARTS FROM STORY: {story_detected_parts}
+
+    DETECTED PARTS ARRAY (from images): {ai_detected_parts}
+
+    Instructions:
+    - Compare what the accident story describes (impact directions, collision type) with what damage is actually visible in the images
+    - Identify any discrepancies between expected damage locations and actual visible damage
+    - Point out if claimed impact areas are not supported by visual evidence
+    - Do NOT mention estimate copy, financial details, or repair costs
+    - Focus exclusively on physical consistency between story description and visual damage evidence
+    - Provide a clear, concise 3-4 line analysis
+
+    Return only the consistency analysis text, no JSON format needed.
     """
     
     try:
         response = azure_openai_client.chat.completions.create(
             model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
             messages=[
-                {"role": "system", "content": "You are an expert automotive parts specialist."},
+                {"role": "system", "content": "You are an expert vehicle accident analyst specializing in consistency analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=300
+        )
+        
+        content = response.choices[0].message.content
+        if not content:
+            return "Unable to generate consistency analysis."
+        
+        return content.strip()
+        
+    except Exception as e:
+        print(f"Error generating consistency summary: {e}")
+        return f"Error generating consistency analysis: {str(e)}"
+
+def analyze_single_accident_consistency_with_vision(car_images: dict, claim_story: str, ai_detected_parts: list = None, model_name: str = "gpt-4o") -> str:
+    """
+    Enhanced visual damage analysis that:
+    1. Identifies collision type from claim story
+    2. Analyzes only relevant images based on collision type
+    3. Uses AI-detected parts for comparison
+    4. Uses multiple LLM calls for thorough analysis
+    """
+    try:
+        # Basic validation
+        if not car_images:
+            return "ERROR: No car images provided for analysis"
+        
+        if not claim_story or not claim_story.strip():
+            return "ERROR: No claim story provided for analysis"
+        
+        # Check if Azure OpenAI client is available
+        if not azure_openai_client:
+            return "ERROR: Azure OpenAI client not configured"
+        
+        # Step 1: Identify collision type by matching AI-interpreted parts and claim story
+        collision_analysis_prompt = f"""
+        Analyze the claim story and AI-detected damaged parts to determine the collision type and relevant views for analysis:
+
+        CLAIM STORY: {claim_story}
+        AI-DETECTED DAMAGED PARTS: {ai_detected_parts if ai_detected_parts else 'None detected'}
+
+        Match the claim story with the damaged parts to determine:
+        1. Primary collision type based on BOTH story and damaged parts location
+        2. Which car view(s) would show the most relevant damage
+
+        COLLISION TYPE LOGIC:
+        - FRONT: If story mentions front impact AND parts include front bumper, headlights, grille, hood
+        - REAR: If story mentions rear impact AND parts include rear bumper, taillights, trunk
+        - SIDE: If story mentions side impact AND parts include doors, side panels, mirrors
+        - MULTIPLE: If story describes multiple impacts OR parts span multiple areas (front+rear, front+side, etc.)
+
+        Respond with only: "[COLLISION_TYPE]: [RELEVANT_VIEWS]"
+        Examples:
+        "FRONT: front"
+        "REAR: rear" 
+        "SIDE: left,right"
+        "MULTIPLE: front,rear"
+        """
+        
+        print(f"DEBUG: Analyzing collision type with AI parts: {ai_detected_parts}")
+        
+        collision_response = azure_openai_client.chat.completions.create(
+            model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+            messages=[
+                {"role": "system", "content": "You are an expert accident analyst."},
+                {"role": "user", "content": collision_analysis_prompt}
+            ],
+            temperature=0,
+            max_tokens=75
+        )
+        
+        collision_analysis = collision_response.choices[0].message.content.strip()
+        print(f"DEBUG: Collision analysis result: {collision_analysis}")
+        
+        # Parse collision type and relevant views with better cleaning
+        if ":" in collision_analysis:
+            collision_type, relevant_views_str = collision_analysis.split(":", 1)
+            collision_type = collision_type.strip()
+            
+            # Clean up the views string and split by comma
+            relevant_views_str = relevant_views_str.strip()
+            # Remove any quotes, brackets, or extra formatting
+            relevant_views_str = relevant_views_str.replace('"', '').replace("'", "").replace('[', '').replace(']', '')
+            relevant_views = [view.strip() for view in relevant_views_str.split(",") if view.strip()]
+        else:
+            # Fallback - analyze all available images
+            relevant_views = list(car_images.keys())
+            collision_type = "UNKNOWN"
+        
+        print(f"DEBUG: Determined collision type: {collision_type}, Relevant views: {relevant_views}")
+        
+        # Step 2: Select and prepare only relevant images
+        relevant_image_data = []
+        available_views = []
+        
+        print(f"DEBUG: Relevant views to analyze: {relevant_views}")
+        print(f"DEBUG: Available car images: {list(car_images.keys())}")
+        
+        for view in relevant_views:
+            if view in car_images:
+                try:
+                    image = car_images[view]
+                    print(f"DEBUG: Processing image for view: {view}")
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
+                        image.save(tmp_file.name, format="PNG")
+                        with open(tmp_file.name, "rb") as f:
+                            img_bytes = f.read()
+                        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+                        relevant_image_data.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                        })
+                        available_views.append(view)
+                        os.unlink(tmp_file.name)  # Clean up temp file
+                        print(f"DEBUG: Successfully processed image for view: {view}")
+                except Exception as img_error:
+                    print(f"DEBUG: Error processing image for view {view}: {img_error}")
+                    continue
+        
+        if not relevant_image_data:
+            return f"UNABLE: No relevant images available for analysis. Needed: {relevant_views}, Available: {list(car_images.keys())}"
+        
+        # Step 3: Enhanced visual analysis with AI-detected parts context
+        ai_parts_context = ""
+        if ai_detected_parts:
+            ai_parts_context = f"\n\nAI-DETECTED DAMAGED PARTS: {', '.join(ai_detected_parts)}"
+        
+        enhanced_prompt = f"""
+        You are an expert vehicle accident analyst. Focus ONLY on detecting "mirror damage" patterns that indicate multiple separate impacts rather than single collisions.
+
+        CLAIM STORY: {claim_story}
+        COLLISION TYPE: {collision_type}
+        ANALYZING VIEWS: {', '.join(available_views)}{ai_parts_context}
+
+        CRITICAL ANALYSIS - Focus on this specific pattern:
+
+        FOR {collision_type} COLLISION, look specifically for:
+        - FRONT: Both LEFT and RIGHT headlights damaged BUT center grille/bumper is intact/undamaged
+        - REAR: Both LEFT and RIGHT taillights damaged BUT center rear bumper is intact/undamaged  
+        - SIDE: Multiple side panels damaged with gaps of undamaged areas between them
+
+        INCONSISTENT PATTERN (mark as INCONSISTENT):
+        - If you see damage on BOTH left and right sides while the connecting CENTER part is undamaged
+        - This indicates two separate corner impacts instead of one central collision
+
+        CONSISTENT PATTERN (mark as CONSISTENT):
+        - Damage follows logical force transfer from a single impact point
+        - OR damage is only on one side
+        - OR center part is damaged along with sides (normal single impact pattern)
+        - OR any other pattern that doesn't show the specific "mirror damage"
+
+        Response Format:
+        - If CONSISTENT (normal single collision pattern): Respond with only "CONSISTENT"
+        - If INCONSISTENT (mirror damage pattern detected): Respond with "INCONSISTENT: [brief explanation of why]"
+
+        Examples:
+        - "CONSISTENT"
+        - "INCONSISTENT: Both headlights damaged but center grille intact indicates separate corner impacts"
+        """
+        
+        # Step 4: Perform visual analysis
+        messages = [
+            {"role": "system", "content": "You are an expert vehicle damage pattern analyst."},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": enhanced_prompt}] + relevant_image_data
+            }
+        ]
+        
+        response = azure_openai_client.chat.completions.create(
+            model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+            messages=messages,
+            temperature=0,
+            max_tokens=100
+        )
+        
+        result = response.choices[0].message.content
+        if not result:
+            return "UNKNOWN: Unable to analyze damage patterns"
+        
+        return result.strip()
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error analyzing single accident consistency: {error_msg}")
+        
+        # More specific error messages for debugging
+        if "vision" in error_msg.lower():
+            return "ERROR: Vision model not available or not configured properly"
+        elif "token" in error_msg.lower() or "quota" in error_msg.lower():
+            return "ERROR: Token limit or quota exceeded"
+        elif "image" in error_msg.lower():
+            return "ERROR: Image processing failed"
+        elif "deployment" in error_msg.lower():
+            return "ERROR: Azure OpenAI deployment issue"
+        else:
+            return f"ERROR: {error_msg[:100]}..."  # Show first 100 chars of error
+
+def extract_parts_from_estimate_copy(estimate_text: str, model_name: str = "gpt-4o") -> list:
+    """Extract car parts names from estimate copy text"""
+    if not estimate_text or estimate_text.strip() == "":
+        return []
+    
+    prompt = f"""
+    You are an expert automotive repair estimate analyzer. Analyze the following repair estimate document and extract ALL vehicle part names mentioned in it.
+    
+    Look for parts listed under sections like: 'Parts', 'Parts & Labor', 'Replace', 'Repair', 'Body Parts', 'Components', 'Items', etc.
+    Focus on identifying actual vehicle components that need repair or replacement.
+    
+    ESTIMATE COPY TEXT:
+    {estimate_text}
+    
+    Extract only the actual vehicle part names from the estimate, not prices, labor costs, shop supplies, or other non-part items.
+    If you find multiple entries for the same part, list it only once.
+    Return ONLY a JSON array of part names, e.g. ["front bumper", "headlights", "windshield", "radiator", "door panel"]
+    If no vehicle parts are found, return an empty array [].
+    """
+    
+    try:
+        response = azure_openai_client.chat.completions.create(
+            model=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"),
+            messages=[
+                {"role": "system", "content": "You are an expert automotive repair estimate analyzer."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0,
@@ -283,7 +509,7 @@ def extract_parts_from_estimate_copy(estimate_text: str, model_name: str = "gpt-
         print(f"Error extracting parts from estimate: {e}")
         return []
 
-def filter_damage_report(damage_report_text: str, potential_parts: list, model_name: str = "gpt-4o", estimate_text: str = "", estimate_parts: list = None, ai_detected_parts: list | None = None, ai_part_reasons: dict | None = None) -> dict:
+def filter_damage_report(damage_report_text: str, potential_parts: list, model_name: str = "gpt-4o", estimate_text: str = "", estimate_parts: list = None, ai_detected_parts: list | None = None, ai_part_reasons: dict | None = None, claim_story_text: str = "") -> dict:
     """Filter damage report to only show damages related to potential parts from story"""
     
     # Use provided estimate_parts or fallback to empty list
@@ -331,7 +557,7 @@ def filter_damage_report(damage_report_text: str, potential_parts: list, model_n
         • Rear impact parts: Rear panel, boot floor, spare wheel housing, rear impact bar, rear crash sensors, fuel tank, wiring harness, rear suspension links, trunk latch mechanism
         • Side impact parts: Door beams, curtain airbags, seatbelt pretensioners, wiring inside doors, window regulator, power window motor, side impact sensors, B-pillar, seats and frames
         • Hidden/Internal damage: Frame rails, subframe, suspension mounts, steering column (front), rear axle beam (rear), floor pan, insulation, soundproofing materials
-    7. Provide a brief summary and a recommendation (Approve/Investigate/Deny) based on your findings.
+    7. For the summary section, your task is to compare the `POTENTIAL PARTS FROM STORY` ({potential_parts}) with the `DETECTED PARTS ARRAY` ({ai_detected_parts}) (from images) and generate a 3-4 line consistency analysis. Evaluate if the visually detected damages logically support the accident description. For example, if the story claims impacts to the front, back, and left, but the detected parts only show front damage, your summary must explicitly state that the back and left impacts are not visually substantiated by the provided images. Do not mention the estimate copy or financial details in this summary; focus only on the physical consistency between the story and the visual evidence.
 
     POTENTIAL PARTS FROM STORY (detailed): {potential_parts}
     POTENTIAL PART NAMES (story filter): {potential_part_names}
@@ -351,12 +577,14 @@ def filter_damage_report(damage_report_text: str, potential_parts: list, model_n
 
     COVERAGE MANDATE FOR ESTIMATE PARTS:
     - EVERY part from the EXTRACTED PARTS FROM ESTIMATE COPY must appear in EXACTLY ONE of these lists: 'relevant_damages', 'doubtful_damages', or 'rejected_parts'.
+    - All estimate copy parts must be categorized: each part should be placed in either matched (relevant_damages), doubtful, or rejected categories based on the following logic: (1) matched if the part shows visible damage in images AND aligns with the claim story impact direction, (2) rejected if the part shows no visible damage in images OR contradicts the claim story physics, (3) doubtful if the part could be damaged but requires inspection OR if confidence is not ≥80% for either matching or rejecting.
     - Do NOT omit or duplicate any estimate part. If uncertain between match and reject, choose 'doubtful_damages' and provide a clear one-line reason.
     - When placing an estimate part into 'relevant_damages', use the closest matching part name from the DETECTED PARTS ARRAY (authoritative list). If there is no sensible match in the DETECTED PARTS ARRAY, do not force it into 'relevant_damages'; use 'doubtful_damages' or 'rejected_parts' per rules above.
 
     MATCHING GUIDELINES FOR 'relevant_damages':
     - Always choose parts from the DETECTED PARTS ARRAY above. Do not generate or rename parts.
     - Include a part when it is likely to be damaged given the claim story and impact direction. Alignment with POTENTIAL PART NAMES from the story is helpful but not mandatory word-for-word.
+    - CRITICAL: Only show parts in 'relevant_damages' that appear in BOTH the estimate copy list ({estimate_parts}) AND the AI-interpreted potentially impacted parts list ({ai_detected_parts}). Parts must exist in both lists to be considered for matching. Note: Allow for slight name variations that mean the same thing (e.g., "front bumper" vs "bumper front", "headlight" vs "head light", "door panel" vs "door", "fender" vs "front fender", "mirror" vs "side mirror", etc.). Consider semantic similarity, not just exact string matching.
     - If there is no overlap between likely parts and the DETECTED PARTS ARRAY, leave 'relevant_damages' empty.
 
     Return your analysis in this JSON format:
@@ -428,6 +656,7 @@ def filter_damage_report(damage_report_text: str, potential_parts: list, model_n
         "recommendation": "Approve/Investigate/Deny"
     }}
 
+    
     STRICT RULES:
     - 'relevant_damages' MUST be selected only from the DETECTED PARTS ARRAY (AI-interpreted parts). Do not output parts not present in that list.
     - Include parts in 'relevant_damages' when you assess they are likely to be damaged due to the same accident as described in the claim form story, with soft alignment to POTENTIAL PART NAMES.
@@ -437,7 +666,7 @@ def filter_damage_report(damage_report_text: str, potential_parts: list, model_n
     - Be strict and accurate in your analysis. Never include impossible damages.
     - 'rejected_parts' should ONLY include parts from the "EXTRACTED PARTS FROM ESTIMATE COPY" list that meet either criteria: (a) NOT found in the damage report text (presence check fails) — use the reason starting with "No visible damage in the damage report for this part", OR (b) are present in the damage report text but cannot be plausibly linked to this specific accident based on the claim story — use the reason starting with "Not possible according to the claim story". Include a part in 'rejected_parts' ONLY when you are highly certain. Use only the parts provided in the extracted list. Do not include any parts from claim story or generate parts yourself.
     - For doubtful damages, focus on selecting the most relevant internal components from the provided lists that match the collision type and impact direction described in the claim story.
-    - COVERAGE: Every estimate part must be classified into exactly one of 'relevant_damages', 'doubtful_damages', or 'rejected_parts'. If unsure, prefer 'doubtful_damages' with a succinct reason (e.g., inspection required). Never omit an estimate part from these three lists.
+    - MANDATORY COVERAGE: Every single estimate part from {estimate_parts} must be classified into exactly one of 'relevant_damages', 'doubtful_damages', or 'rejected_parts'. NO EXCEPTIONS. If unsure, prefer 'doubtful_damages' with a succinct reason (e.g., inspection required). Never omit an estimate part from these three lists. Double-check that each estimate part appears exactly once across all three categories before finalizing your response.
     """
     
     try:
@@ -477,6 +706,43 @@ def filter_damage_report(damage_report_text: str, potential_parts: list, model_n
             try:
                 decoder = json.JSONDecoder()
                 obj, _ = decoder.raw_decode(json_str)
+                
+                # Ensure recommendation is not empty
+                if not obj.get('recommendation') or obj.get('recommendation').strip() == "":
+                    # Determine recommendation based on rejected parts and consistency
+                    rejected_count = len(obj.get('rejected_parts', []))
+                    doubtful_count = len(obj.get('doubtful_damages', []))
+                    
+                    if rejected_count > 2:
+                        obj['recommendation'] = "Investigate"
+                    elif rejected_count > 0 or doubtful_count > 3:
+                        obj['recommendation'] = "Investigate"
+                    else:
+                        obj['recommendation'] = "Approve"
+                
+                # Generate specialized summary using the new function
+                # Extract simple part names from potential_parts for the summary function
+                story_parts = []
+                try:
+                    for p in (potential_parts or []):
+                        if isinstance(p, (list, tuple)) and len(p) >= 1:
+                            story_parts.append(p[0])
+                        else:
+                            story_parts.append(str(p))
+                except Exception:
+                    story_parts = potential_parts or []
+                
+                # Generate the specialized summary
+                specialized_summary = generate_story_vs_visual_consistency_summary(
+                    claim_story=claim_story_text or "No claim story provided",
+                    story_detected_parts=story_parts,
+                    ai_detected_parts=ai_detected_parts or [],
+                    model_name=model_name
+                )
+                
+                # Replace the summary with our specialized one
+                obj['summary'] = specialized_summary
+                
                 return obj
             except Exception as e:
                 return {
@@ -1021,7 +1287,7 @@ def generate_pdf_report_with_dr():
                     ai_part_reasons[name] = rsn
     except Exception:
         ai_part_reasons = {}
-    result = filter_damage_report(damage_report_text, potential_parts, model_name, estimate_text, estimate_parts, ai_part_reasons=ai_part_reasons)
+    result = filter_damage_report(damage_report_text, potential_parts, model_name, estimate_text, estimate_parts, ai_part_reasons=ai_part_reasons, claim_story_text=policy_story)
     
     matched_parts = result.get('relevant_damages', [])
     doubtful_parts = result.get('doubtful_damages', [])
@@ -1068,7 +1334,7 @@ def generate_pdf_report_without_dr():
                     ai_part_reasons[name] = rsn
     except Exception:
         ai_part_reasons = {}
-    result = filter_damage_report(damage_report_text, potential_parts, model_name, estimate_text, estimate_parts, ai_part_reasons=ai_part_reasons)
+    result = filter_damage_report(damage_report_text, potential_parts, model_name, estimate_text, estimate_parts, ai_part_reasons=ai_part_reasons, claim_story_text=claim_description)
     
     image_damage_dict = {k: [p[0] for p in v] for k, v in per_image_potential_parts.items()}
     # Build consistency prompt with estimate context and unobserved claimed parts
@@ -1117,6 +1383,7 @@ def generate_pdf_report_without_dr():
     - Verify damage severity is consistent with described impact force and direction.
     - Look for contradictory damage patterns (e.g., both front and rear damage from a single-direction collision).
     - Assess if damage distribution follows logical impact physics and force transfer.
+    - Check for inconsistent damage patterns within the same area: if adjacent parts show damage but connecting parts are undamaged, flag as potentially inconsistent (e.g., both left and right front headlights damaged but front bumper and hood are intact, suggesting separate incidents rather than a single collision).
     - Compare estimate parts vs. AI-observed damages: explain whether any unobserved claimed parts are plausibly hidden/internal from the described impact or suggest unrelated/previous damage.
 
     Provide a concise 3–4 line assessment in measured, diplomatic language. Avoid using single-word labels like "consistent" or "inconsistent". End with a neutral line beginning with "Overall assessment:" that summarizes alignment and any exceptions.
@@ -1154,19 +1421,8 @@ def generate_pdf_report_without_dr():
 
 
 def main():
-    # Sidebar for navigation
-    with st.sidebar:
-        st.markdown("## 📋 Analysis Options")
-        analysis_option = st.radio(
-            "Choose your analysis method:",
-            ["With Damage Report", "Without Damage Report"],
-            index=1  # Default to "Without Damage Report Filter"
-        )
-    
-    if analysis_option == "With Damage Report":
-        with_damage_report_workflow()
-    else:
-        without_damage_report_workflow()
+    # Always show the Without Damage Report workflow for now
+    without_damage_report_workflow()
 
 def with_damage_report_workflow():
 
@@ -1270,21 +1526,46 @@ def with_damage_report_workflow():
                 st.session_state['estimate_text'] = estimate_text
                 st.session_state['estimate_file_name'] = uploaded_estimate.name
                 st.success(f"✅ PDF estimate uploaded: {uploaded_estimate.name}")
-                with st.expander("📋 Estimate PDF Preview"):
-                    st.text_area("Extracted Estimate Content", estimate_text, height=200, disabled=True)
             else:
                 estimate_text = uploaded_estimate.read().decode('utf-8')
                 st.session_state['estimate_text'] = estimate_text
                 st.session_state['estimate_file_name'] = uploaded_estimate.name
                 st.success(f"✅ Text estimate uploaded: {uploaded_estimate.name}")
-                with st.expander("📋 Estimate Preview"):
-                    st.text_area("Estimate Content", estimate_text, height=200, disabled=True)
+            
+            with st.spinner("🔍 Extracting parts from estimate copy..."):
+                model_name = "gpt-4o"
+                estimate_parts = extract_parts_from_estimate_copy(st.session_state['estimate_text'], model_name)
+                st.session_state['extracted_estimate_parts'] = estimate_parts
+
+            if st.session_state.get('extracted_estimate_parts'):
+                st.markdown('<div style="height: 20px"></div>', unsafe_allow_html=True)
+                st.markdown('<h4 class="section-header">📋 Extracted Estimate Parts</h4>', unsafe_allow_html=True)
+                st.success("✅ Successfully extracted vehicle parts from estimate copy!")
+                
+                # Display extracted parts in a clean format
+                cols = st.columns(3)
+                for i, ep in enumerate(st.session_state['extracted_estimate_parts']):
+                    with cols[i % 3]:
+                        st.markdown(f"""
+                        <div style='background: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid #007bff;'>
+                            <strong>🔧 {str(ep)}</strong>
+                        </div>
+                        """, unsafe_allow_html=True)
+                
+                st.info(f"📊 **Total parts found:** {len(st.session_state['extracted_estimate_parts'])}")
+                st.markdown('<div style="height: 15px"></div>', unsafe_allow_html=True)
+            else:
+                st.warning("⚠️ No parts were extracted from the estimate copy. Please check the file content.")
         
-        # Require estimate before proceeding
+        # Require estimate and extracted parts before proceeding
         if uploaded_estimate is not None:
-            if st.button("Analyze Reports and Forms", type="primary", use_container_width=True):
-                st.session_state['estimate_uploaded'] = True
-                st.rerun()
+            extracted_parts = st.session_state.get('extracted_estimate_parts', [])
+            if extracted_parts and len(extracted_parts) > 0:
+                if st.button("Analyze Reports and Forms", type="primary", use_container_width=True):
+                    st.session_state['estimate_uploaded'] = True
+                    st.rerun()
+            else:
+                st.error("⚠️ Cannot proceed: No vehicle parts were extracted from the estimate copy. Please upload a valid estimate document with vehicle parts listed.")
         else:
             st.warning("⚠️ Please upload an estimate copy to proceed with the analysis.")
         return
@@ -1319,6 +1600,11 @@ def with_damage_report_workflow():
 
     with st.spinner("🔍 Extracting parts from estimate copy..."):
         estimate_parts = extract_parts_from_estimate_copy(estimate_text, model_name)
+        # Cache for display on the main page
+        try:
+            st.session_state['extracted_estimate_parts'] = estimate_parts
+        except Exception:
+            pass
 
     with st.spinner("🔍 Filtering damage report based on claim form..."):
         # Use AI-interpreted parts from claim story as the authoritative set
@@ -1344,7 +1630,8 @@ def with_damage_report_workflow():
             estimate_text,
             estimate_parts,
             ai_detected_parts=ai_detected_parts,
-            ai_part_reasons=ai_part_reasons
+            ai_part_reasons=ai_part_reasons,
+            claim_story_text=policy_story
         )
 
     # Precompute PDF once to avoid rerun on download
@@ -1503,21 +1790,46 @@ def without_damage_report_workflow():
                 st.session_state['estimate_text'] = estimate_text
                 st.session_state['estimate_file_name'] = uploaded_estimate.name
                 st.success(f"✅ PDF estimate uploaded: {uploaded_estimate.name}")
-                with st.expander("📋 Estimate PDF Preview"):
-                    st.text_area("Extracted Estimate Content", estimate_text, height=200, disabled=True)
             else:
                 estimate_text = uploaded_estimate.read().decode('utf-8')
                 st.session_state['estimate_text'] = estimate_text
                 st.session_state['estimate_file_name'] = uploaded_estimate.name
                 st.success(f"✅ Text estimate uploaded: {uploaded_estimate.name}")
-                with st.expander("📋 Estimate Preview"):
-                    st.text_area("Estimate Content", estimate_text, height=200, disabled=True)
         
-        # Require estimate before proceeding
+            with st.spinner("🔍 Extracting parts from estimate copy..."):
+                model_name = "gpt-4o"
+                estimate_parts = extract_parts_from_estimate_copy(st.session_state['estimate_text'], model_name)
+                st.session_state['extracted_estimate_parts'] = estimate_parts
+
+            if st.session_state.get('extracted_estimate_parts'):
+                st.markdown('<div style="height: 20px"></div>', unsafe_allow_html=True)
+                st.markdown('<h4 class="section-header">📋 Extracted Estimate Parts</h4>', unsafe_allow_html=True)
+                st.success("✅ Successfully extracted vehicle parts from estimate copy!")
+                
+                # Display extracted parts in a clean format
+                cols = st.columns(3)
+                for i, ep in enumerate(st.session_state['extracted_estimate_parts']):
+                    with cols[i % 3]:
+                        st.markdown(f"""
+                        <div style='background: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid #007bff;'>
+                            <strong>🔧 {str(ep)}</strong>
+                        </div>
+                        """, unsafe_allow_html=True)
+                
+                st.info(f"📊 **Total parts found:** {len(st.session_state['extracted_estimate_parts'])}")
+                st.markdown('<div style="height: 15px"></div>', unsafe_allow_html=True)
+            else:
+                st.warning("⚠️ No parts were extracted from the estimate copy. Please check the file content.")
+
+        # Require estimate and extracted parts before proceeding
         if uploaded_estimate is not None:
-            if st.button("Analyze Images and Forms", type="primary", use_container_width=True):
-                st.session_state['estimate_uploaded'] = True
-                st.rerun()
+            extracted_parts = st.session_state.get('extracted_estimate_parts', [])
+            if extracted_parts and len(extracted_parts) > 0:
+                if st.button("Analyze Images and Forms", type="primary", use_container_width=True):
+                    st.session_state['estimate_uploaded'] = True
+                    st.rerun()
+            else:
+                st.error("⚠️ Cannot proceed: No vehicle parts were extracted from the estimate copy. Please upload a valid estimate document with vehicle parts listed.")
         else:
             st.warning("⚠️ Please upload an estimate copy to proceed with the analysis.")
         return
@@ -1583,7 +1895,7 @@ def without_damage_report_workflow():
                                 ai_part_reasons[name] = rsn
             except Exception:
                 ai_part_reasons = {}
-            result = filter_damage_report(damage_report_text, potential_parts, model_name, estimate_text, estimate_parts, ai_detected_parts=ai_detected_parts, ai_part_reasons=ai_part_reasons)
+            result = filter_damage_report(damage_report_text, potential_parts, model_name, estimate_text, estimate_parts, ai_detected_parts=ai_detected_parts, ai_part_reasons=ai_part_reasons, claim_story_text=claim_description)
             # Remove additional damages from result
             if 'additional_damages' in result:
                 result['additional_damages'] = []
@@ -1660,7 +1972,7 @@ def without_damage_report_workflow():
         Parts claimed in estimate but NOT observed as damaged in images (unobserved claimed parts):
         {unobserved_claimed}
 
-        Follow this strict 2-step process:
+        Follow this strict 3-step process:
         1) Compare Estimate Copy parts with the Claim Story:
            - If the claim story describes a collision type (e.g., front collision) and the estimate lists relevant parts (e.g., front bumper, fender), consider that consistent.
            - If the estimate parts do not align with the described collision type or location, mark inconsistent with a brief reason tied to physics/direction.
@@ -1668,8 +1980,11 @@ def without_damage_report_workflow():
            - If the damage report shows extra damaged areas not included in the estimate, do NOT mark inconsistent based only on that; missing items in the estimate are acceptable.
            - Mark inconsistent only if the estimate claims repairs that contradict the damage report or the claim story (e.g., estimate claims rear repairs but images/story show only a clear front impact with no rear damage).
            - If an estimate part is not visible in images but could reasonably be hidden/internal based on the impact, treat as plausible; do not mark inconsistent solely for non-visibility—note uncertainty briefly.
+        3) Check for inconsistent damage patterns within the same area:
+           - If adjacent parts show damage but connecting parts are undamaged, flag as potentially inconsistent (e.g., both left and right front headlights damaged but front bumper and hood are intact, suggesting separate incidents rather than a single collision).
+           - Verify that the damage pattern follows logical impact physics and force transfer for a single accident.
 
-    Provide a concise 3–4 line assessment in measured language, avoiding single-word verdicts like "consistent" or "inconsistent". Summarize alignment and any exceptions from Steps 1 and 2. End with a neutral line beginning with "Overall assessment:".
+        Provide a concise 3–4 line assessment in measured language. Summarize alignment and any exceptions from Steps 1 and 2".
         """
         try:
             consistency_response = azure_openai_client.chat.completions.create(
@@ -1702,9 +2017,9 @@ def without_damage_report_workflow():
             st.session_state['pdf_data'] = pdf_bytes
         except Exception:
             pass
-        display_combined_analysis(per_image_potential_parts, potential_parts, result, combined_image_names, model_name, consistency_report=consistency_report)
+        display_combined_analysis(per_image_potential_parts, potential_parts, result, combined_image_names, model_name, consistency_report=consistency_report, claim_description=claim_description, ai_detected_parts=ai_detected_parts)
 
-def display_combined_analysis(per_image_potential_parts, potential_parts, result, file_name, model_name, consistency_report: str | None = None):
+def display_combined_analysis(per_image_potential_parts, potential_parts, result, file_name, model_name, consistency_report: str | None = None, claim_description: str = "", ai_detected_parts: list = None):
     """Display 4 sections for AI-Interpreted Potentially Impacted Parts, rest combined"""
     st.markdown('<div style="height: 24px"></div>', unsafe_allow_html=True)
     st.markdown('<h2 class="section-header" style="margin-bottom: 2.5rem;">🔎 Analysis Results</h2>', unsafe_allow_html=True)
@@ -1754,6 +2069,19 @@ def display_combined_analysis(per_image_potential_parts, potential_parts, result
     st.markdown('<div style="height: 14px"></div>', unsafe_allow_html=True)
     st.markdown('<hr style="border:none; border-top:1px solid var(--border);"/>', unsafe_allow_html=True)
     st.markdown('<div style="height: 10px"></div>', unsafe_allow_html=True)
+    # Extracted Estimate Parts
+    estimate_parts_display = st.session_state.get('extracted_estimate_parts', [])
+    if estimate_parts_display:
+        st.markdown('<h3 class="section-header" style="margin-bottom: 1.2rem;">🧾 Extracted Estimate Parts</h3>', unsafe_allow_html=True)
+        cols = st.columns(3)
+        for i, ep in enumerate(estimate_parts_display):
+            with cols[i % 3]:
+                st.markdown(f"""
+                <div class='result-box' style='margin-bottom: 10px;'>
+                    • {str(ep)}
+                </div>
+                """, unsafe_allow_html=True)
+        st.markdown('<div style="height: 14px"></div>', unsafe_allow_html=True)
     # Relevant damages (combined)
     if result.get('relevant_damages'):
         st.markdown('<h3 class="section-header" style="margin-bottom: 1.5rem;">✅ Matched Damages</h3>', unsafe_allow_html=True)
@@ -1820,7 +2148,7 @@ def display_combined_analysis(per_image_potential_parts, potential_parts, result
             unobserved_claimed = []
 
         consistency_prompt = f"""
-        You are an expert vehicle accident analyst. Analyze consistency using a strict 2-step process and output only a concise 3–4 line assessment (same format as usual).
+        You are an expert vehicle accident analyst. Analyze consistency using a strict 3-step process and output a concise 4-5 line assessment.
 
         Detected damaged parts from car images (AI-interpreted):
         {image_damage_dict}
@@ -1837,16 +2165,20 @@ def display_combined_analysis(per_image_potential_parts, potential_parts, result
         Parts claimed in estimate but NOT observed as damaged in images (unobserved claimed parts):
         {unobserved_claimed}
 
-        Follow this strict 2-step process:
+        Follow this strict 3-step process:
         1) Compare Estimate Copy parts with the Claim Story:
            - If the claim story describes a collision type (e.g., front collision) and the estimate lists relevant parts (e.g., front bumper, fender), consider that consistent.
            - If the estimate parts do not align with the described collision type or location, mark inconsistent with a brief reason tied to physics/direction.
         2) Compare Estimate Copy parts with the Damage Report (images/text):
-           - If the damage report shows extra damaged areas not included in the estimate, do NOT mark inconsistent based only on that; missing items in the estimate are acceptable.
+           - If the damage report shows extra damaged areas not included in the estimate, do not mark inconsistent based only on that; mention that this damage is likely due to a prior incident.
            - Mark inconsistent only if the estimate claims repairs that contradict the damage report or the claim story (e.g., estimate claims rear repairs but images/story show only a clear front impact with no rear damage).
-           - If an estimate part is not visible in images but could reasonably be hidden/internal based on the impact, treat as plausible; do not mark inconsistent solely for non-visibility—note uncertainty briefly.
+           - If an estimate part is not visible in images but could plausibly be hidden/internal based on the impact, treat as plausible.
+        3) Check for inconsistent damage patterns within the same area:
+           - If adjacent parts show damage but connecting parts are undamaged, flag as potentially inconsistent (e.g., both left and right front headlights damaged but the front bumper and hood are intact, suggesting separate incidents).
+           - SINGLE ACCIDENT CONSISTENCY: For a single front collision, damage should follow a logical impact pattern from the center outward. If both left and right headlights are damaged but the central grille/bumper is undamaged, this indicates inconsistency.
+           - Verify that the damage pattern follows a logical force transfer for a single accident as per the claim story and explicitly state if the damage pattern is inconsistent with a single collision scenario.
 
-    Provide a concise 3–4 line assessment in measured, diplomatic language, avoiding single-word verdicts like "consistent" or "inconsistent". Summarize alignment and any exceptions from Steps 1 and 2. End with a neutral line beginning with "Overall assessment:".
+        Provide a concise 4-5 line assessment in measured language. Include a specific line explaining your reasoning for step 3 in the end.
         """
         try:
             consistency_response = azure_openai_client.chat.completions.create(
@@ -1861,8 +2193,38 @@ def display_combined_analysis(per_image_potential_parts, potential_parts, result
             consistency_report = consistency_response.choices[0].message.content.strip()
         except Exception as e:
             consistency_report = f"Error checking consistency: {e}"
+
+
+
     st.markdown('<h3 class="section-header" style="margin-bottom: 1.5rem;">🧩 Accident Consistency Check</h3>', unsafe_allow_html=True)
     st.info(consistency_report)
+    
+    # Add visual consistency check using GPT Vision
+    if claim_description and st.session_state.get('car_images'):
+        try:
+            with st.spinner("Analyzing damage patterns with AI Vision..."):
+                visual_consistency = analyze_single_accident_consistency_with_vision(
+                    car_images=st.session_state.get('car_images', {}),
+                    claim_story=claim_description,
+                    ai_detected_parts=ai_detected_parts or [],
+                    model_name=model_name
+                )
+            
+            # Display visual consistency analysis
+            st.markdown('<div style="margin-top: 1rem;"></div>', unsafe_allow_html=True)
+            st.markdown('<h4 style="font-size: 1.1rem; margin-bottom: 0.5rem; color: #1f77b4;">🔍 Visual Damage Pattern Analysis</h4>', unsafe_allow_html=True)
+            
+            # Color code based on result
+            if visual_consistency.startswith("CONSISTENT"):
+                st.success(f"✅ {visual_consistency}")
+            elif visual_consistency.startswith("INCONSISTENT"):
+                st.error(f"⚠️ {visual_consistency}")
+            else:
+                st.info(f"🔎 {visual_consistency}")
+                
+        except Exception as e:
+            st.warning(f"⚠️ Could not perform visual damage analysis: {str(e)}")
+    
     st.markdown('<div style="height: 32px"></div>', unsafe_allow_html=True)
     # Download results (combined)
     st.markdown("---")
@@ -1895,6 +2257,28 @@ def display_analysis_results(potential_parts, result, file_name, model_name, wor
                 {f"<div class='reason-on-hover'>Reason: {safe_reason}</div>" if safe_reason else ''}
             </div>
             ''', unsafe_allow_html=True)
+
+    # Extracted Estimate Parts - Clear and Simple Section
+    estimate_parts_display = st.session_state.get('extracted_estimate_parts', [])
+    if estimate_parts_display:
+        st.markdown('<h3 class="section-header">📋 Extracted Estimate Parts (From Estimate Copy)</h3>', unsafe_allow_html=True)
+        st.markdown("**Parts found in the estimate document:**")
+        
+        # Display in a simple, clean format
+        cols = st.columns(3)
+        for i, ep in enumerate(estimate_parts_display):
+            with cols[i % 3]:
+                st.markdown(f"""
+                <div style='background: #f8f9fa; padding: 12px; border-radius: 8px; margin-bottom: 8px; border-left: 4px solid #007bff;'>
+                    <strong>🔧 {str(ep)}</strong>
+                </div>
+                """, unsafe_allow_html=True)
+        
+        st.markdown(f"**Total parts found:** {len(estimate_parts_display)}")
+        st.markdown("---")  # Add separator
+    else:
+        st.markdown('<h3 class="section-header">📋 Extracted Estimate Parts</h3>', unsafe_allow_html=True)
+        st.info("No estimate copy was uploaded or no parts were found in the estimate document.")
     
     # Summary and recommendation
     col1, col2 = st.columns(2)
